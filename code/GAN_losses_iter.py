@@ -58,6 +58,8 @@ parser.add_argument('--print_every', type=int, default=1000, help='Generate a mi
 parser.add_argument('--save', type='bool', default=True, help='Do we save models, yes or no? It will be saved in extra_folder')
 parser.add_argument('--CIFAR10', type='bool', default=False, help='If True, use CIFAR-10 instead of your own dataset. Make sure image_size is set to 32!')
 parser.add_argument('--CIFAR10_input_folder', default='/home/alexia/Datasets/CIFAR10', help='input folder (automatically downloaded)')
+parser.add_argument('--n_classes', type=int, default=10)
+
 #parser.add_argument('--CIFAR10_input_folder_images', default='/home/alexia/Datasets/CIFAR10_images', help='input folder (to download on http://pjreddie.com/media/files/cifar.tgz and extract)')
 param = parser.parse_args()
 
@@ -124,6 +126,7 @@ import torchvision.transforms as transf
 import torchvision.models as models
 import torchvision.utils as vutils
 import torch.nn.utils.spectral_norm as spectral_norm
+from torch.utils.data import DataLoader as DataLoader
 
 if param.cuda:
 	import torch.backends.cudnn as cudnn
@@ -168,157 +171,121 @@ trans = transf.Compose([
 ## Importing dataset
 data = dset.ImageFolder(root=param.input_folder, transform=trans)
 if param.CIFAR10:
-	data = dset.CIFAR10(root=param.CIFAR10_input_folder, train=True, download=True, transform=trans)
+	data = dset.CIFAR10(root=param.CIFAR10_input_folder, train=True, download=False, transform=trans)
 
 # Loading data randomly
-def generate_random_sample():
-	while True:
-		random_indexes = numpy.random.choice(data.__len__(), size=param.batch_size, replace=False)
-		batch = [data[i][0] for i in random_indexes]
-		yield torch.stack(batch, 0)
-random_sample = generate_random_sample()
+# def generate_random_sample():
+# 	while True:
+# 		random_indexes = numpy.random.choice(data.__len__(), size=param.batch_size, replace=False)
+# 		batch = [data[i][0] for i in random_indexes]
+# 		yield torch.stack(batch, 0)
+# random_sample = generate_random_sample()
+class DataProvider:
+    def __init__(self, data, batch_size):
+        self.data_loader = None
+        self.iter = None
+        self.batch_size = batch_size
+        self.data = data
+        self.data_loader = DataLoader(self.data, batch_size=self.batch_size, shuffle=True, drop_last=True, num_workers=param.num_workers)
+        self.build()
+    def build(self):
+        self.iter = iter(self.data_loader) 
+    def __next__(self):
+        try:
+            return self.iter.next()
+        except StopIteration:  # reload when an epoch finishes
+            self.build()
+            return self.iter.next()
+
+random_sample = DataProvider(data, param.batch_size)
 
 ## Models
 
 if param.arch == 1:
-	title = title + '_CNN_'
+	title = title + '_Conditional_'
 
 	class DCGAN_G(torch.nn.Module):
 		def __init__(self):
 			super(DCGAN_G, self).__init__()
+			model = []
 
-			self.dense = torch.nn.Linear(param.z_size, 512 * 4 * 4)
+			mult = param.image_size // 8
 
-			if param.spectral_G:
-				model = [spectral_norm(torch.nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=True))]
-				model += [torch.nn.ReLU(True),
-					spectral_norm(torch.nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=True))]
-				model += [torch.nn.ReLU(True),
-					spectral_norm(torch.nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=True))]
-				model += [torch.nn.ReLU(True),
-					spectral_norm(torch.nn.Conv2d(64, param.n_colors, kernel_size=3, stride=1, padding=1, bias=True)),
-					torch.nn.Tanh()]
-			else:
-				model = [torch.nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=True)]
-				if not param.no_batch_norm_G:
-					model += [torch.nn.BatchNorm2d(256)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.ReLU(True)]
-				model += [torch.nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=True)]
-				if not param.no_batch_norm_G:
-					model += [torch.nn.BatchNorm2d(128)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.ReLU(True)]
-				model += [torch.nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=True)]
-				if not param.no_batch_norm_G:
-					model += [torch.nn.BatchNorm2d(64)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.ReLU(True)]
-				model += [torch.nn.Conv2d(64, param.n_colors, kernel_size=3, stride=1, padding=1, bias=True),
-					torch.nn.Tanh()]
+			self.label_emb = torch.nn.Embedding(param.n_classes, param.n_classes)
+			self.dense = torch.nn.Linear(param.z_size + param.n_classes, 128)
+			self.bn = torch.nn.BatchNorm1d(128)
+			self.act = torch.nn.ReLU()
+
+			# start block
+			model.append(torch.nn.ConvTranspose2d(128, param.G_h_size * mult, kernel_size=4, stride=1, padding=0, bias=False))  
+			model.append(torch.nn.BatchNorm2d(param.G_h_size * mult))
+			#model.append(torch.nn.LeakyReLU(0.2, inplace=True))
+			model.append(torch.nn.ReLU())
+
+			# middel block
+			while mult > 1:
+				model.append(torch.nn.ConvTranspose2d(param.G_h_size * mult, param.G_h_size * (mult//2), \
+					kernel_size=4, stride=2, padding=1, bias=False))
+				model.append(torch.nn.BatchNorm2d(param.G_h_size * (mult//2)))
+				#model.append(torch.nn.LeakyReLU(0.2, inplace=True))
+				model.append(torch.nn.ReLU())
+
+				mult = mult // 2
+
+			# end block 
+			model.append(torch.nn.ConvTranspose2d(param.G_h_size, param.n_channels, \
+				kernel_size=4, stride=2, padding=1, bias=False))
+			model.append(torch.nn.Tanh())
+
 			self.model = torch.nn.Sequential(*model)
 
-		def forward(self, input):
-			if isinstance(input.data, torch.cuda.FloatTensor) and param.n_gpu > 1:
-				output = torch.nn.parallel.data_parallel(self.model(self.dense(input.view(-1, param.z_size)).view(-1, 512, 4, 4)), input, range(param.n_gpu))
-			else:
-				output = self.model(self.dense(input.view(-1, param.z_size)).view(-1, 512, 4, 4))
-			#print(output.size())
+		def forward(self, input, labels):
+			input = torch.cat((self.label_emb(labels), input.squeeze()), -1)
+			input = self.act(self.bn(self.dense(input))).unsqueeze(-1).unsqueeze(-1)
+			output = self.model(input)
 			return output
+			
 
 	class DCGAN_D(torch.nn.Module):
 		def __init__(self):
 			super(DCGAN_D, self).__init__()
+			model = []
 
-			self.dense = torch.nn.Linear(512 * 4 * 4, 1)
+			# start block
+			model.append(spectral_norm(torch.nn.Conv2d(param.n_channels, param.D_h_size, kernel_size=4, stride=2, padding=1, bias=False)))
+			model.append(torch.nn.LeakyReLU(0.2, inplace=True))
 
-			if param.spectral:
-				model = [spectral_norm(torch.nn.Conv2d(param.n_colors, 64, kernel_size=3, stride=1, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True),
-					spectral_norm(torch.nn.Conv2d(64, 64, kernel_size=4, stride=2, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True),
+			image_size_new = param.image_size // 2
 
-					spectral_norm(torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True),
-					spectral_norm(torch.nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True),
+			# middle block
+			mult = 1
+			while image_size_new > 4:
+				model.append(spectral_norm(torch.nn.Conv2d(param.D_h_size * mult, param.D_h_size * (2*mult), kernel_size=4, stride=2, padding=1, bias=False)))            
+				model.append(torch.nn.LeakyReLU(0.2, inplace=True))
 
-					spectral_norm(torch.nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True),
-					spectral_norm(torch.nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True),
+				image_size_new = image_size_new // 2
+				mult *= 2
 
-					spectral_norm(torch.nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1, bias=True)),
-					torch.nn.LeakyReLU(0.1, inplace=True)]
-			else:
-				model = [torch.nn.Conv2d(param.n_colors, 64, kernel_size=3, stride=1, padding=1, bias=True)]
-				if not param.no_batch_norm_D:
-					model += [torch.nn.BatchNorm2d(64)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
-				model += [torch.nn.Conv2d(64, 64, kernel_size=4, stride=2, padding=1, bias=True)]
-				if not param.no_batch_norm_D:
-					model += [torch.nn.BatchNorm2d(64)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
-				model += [torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=True)]
-				if not param.no_batch_norm_D:
-					model += [torch.nn.BatchNorm2d(128)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
-				model += [torch.nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1, bias=True)]
-				if not param.no_batch_norm_D:
-					model += [torch.nn.BatchNorm2d(128)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
-				model += [torch.nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=True)]
-				if not param.no_batch_norm_D:
-					model += [torch.nn.BatchNorm2d(256)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
-				model += [torch.nn.Conv2d(256, 256, kernel_size=4, stride=2, padding=1, bias=True)]
-				if not param.no_batch_norm_D:
-					model += [torch.nn.BatchNorm2d(256)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
-				model += [torch.nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1, bias=True)]
-				if param.Tanh_GD:
-					model += [torch.nn.Tanh()]
-				else:
-					model += [torch.nn.LeakyReLU(0.1, inplace=True)]
 			self.model = torch.nn.Sequential(*model)
+			self.mult = mult
 
-			self.sig = torch.nn.Sigmoid()
+			# end block
+			in_size  = int(param.D_h_size * mult * 4 * 4) 
 
-		def forward(self, input):
-			if isinstance(input.data, torch.cuda.FloatTensor) and param.n_gpu > 1:
-				output = torch.nn.parallel.data_parallel(self.dense(self.model(input).view(-1, 512 * 4 * 4)).view(-1), input, range(param.n_gpu))
-			else:
-				output = self.dense(self.model(input).view(-1, 512 * 4 * 4)).view(-1)
-			if param.loss_D in [1]:
-				output = self.sig(output)
-			#print(output.size())
+			self.label_emb = torch.nn.Embedding(param.n_classes, param.n_classes)
+			self.fc = spectral_norm(torch.nn.Linear(in_size + param.n_classes, 1, bias=False))
+
+		def forward(self, input, labels):
+			y = self.model(input)
+			y = y.view(-1, param.D_h_size * self.mult * 4 * 4)
+			y = torch.cat((self.label_emb(labels), y), -1)
+			
+			output = self.fc(y).view(-1, 1)
+
 			return output
+			
 
-if param.arch == 0:
+elif param.arch == 0:
 	# DCGAN generator
 	class DCGAN_G(torch.nn.Module):
 		def __init__(self):
@@ -459,6 +426,9 @@ if param.arch == 0:
 			# Convert from 1 x 1 x 1 to 1 so that we can compare to given label (cat or not?)
 			return output.view(-1)
 
+else:
+	pass
+
 ## Initialization
 G = DCGAN_G()
 D = DCGAN_D()
@@ -485,6 +455,7 @@ BCE_stable_noreduce = torch.nn.BCEWithLogitsLoss(reduce=False)
 
 # Soon to be variables
 x = torch.FloatTensor(param.batch_size, param.n_colors, param.image_size, param.image_size)
+#y = torch.LongTensor(param.batch_size)
 x_fake = torch.FloatTensor(param.batch_size, param.n_colors, param.image_size, param.image_size)
 y = torch.FloatTensor(param.batch_size)
 y2 = torch.FloatTensor(param.batch_size)
@@ -497,6 +468,8 @@ u = torch.FloatTensor(param.batch_size, 1, 1, 1)
 z_test = torch.FloatTensor(param.batch_size, param.z_size, 1, 1).normal_(0, 1)
 # For the gradients, we need to specify which one we want and want them all
 grad_outputs = torch.ones(param.batch_size)
+
+_, label_test = random_sample.__next__()
 
 # Everything cuda
 if param.cuda:
@@ -513,6 +486,7 @@ if param.cuda:
 	u = u.cuda()
 	z = z.cuda()
 	z_test = z_test.cuda()
+	label_test = label_test.cuda()
 	grad_outputs = grad_outputs.cuda()
 
 # Now Variables
@@ -522,6 +496,7 @@ y = Variable(y)
 y2 = Variable(y2)
 z = Variable(z)
 z_test = Variable(z_test)
+label_test = Variable(label_test)
 
 # Based on DCGAN paper, they found using betas[0]=.50 better.
 # betas[0] represent is the weight given to the previous mean of the gradient
@@ -545,6 +520,7 @@ if param.load:
 	decayG.load_state_dict(checkpoint['G_scheduler'])
 	decayD.load_state_dict(checkpoint['D_scheduler'])
 	z_test.copy_(checkpoint['z_test'])
+	label_test.copy_(checkpoint['label_test'])
 	del checkpoint
 	print(f'Resumed from iteration {current_set_images*param.gen_every}.')
 else:
@@ -561,7 +537,10 @@ for i in range(iter_offset, param.n_iter):
 
 	# Fake images saved
 	if i % param.print_every == 0:
-		fake_test = G(z_test)
+		if param.arch == 1:
+			fake_test = G(z_test, label_test)
+		else:
+			fake_test = G(z_test)
 		vutils.save_image(fake_test.data, '%s/images/fake_samples_iter%05d.png' % (base_dir, i), normalize=True)
 
 	for p in D.parameters():
@@ -574,15 +553,19 @@ for i in range(iter_offset, param.n_iter):
 		########################
 
 		D.zero_grad()
-		images = random_sample.__next__()
+		images, labels = random_sample.__next__()
 		# Mostly necessary for the last one because if N might not be a multiple of batch_size
 		current_batch_size = images.size(0)
 		if param.cuda:
 			images = images.cuda()
+			labels = labels.cuda()
 		# Transfer batch of images to x
 		x.data.resize_as_(images).copy_(images)
 		del images
-		y_pred = D(x)
+		if param.arch == 1:
+			y_pred = D(x, labels)
+		else:
+			y_pred = D(x)
 
 		if param.show_graph and i == 0:
 			# Visualization of the autograd graph
@@ -606,11 +589,17 @@ for i in range(iter_offset, param.n_iter):
 
 			# Train with fake data
 			z.data.resize_(current_batch_size, param.z_size, 1, 1).normal_(0, 1)
-			fake = G(z)
+			if param.arch == 1:
+				fake = G(z, labels)
+			else:
+				fake = G(z)
 			x_fake.data.resize_(fake.data.size()).copy_(fake.data)
 			y.data.resize_(current_batch_size).fill_(0)
 			# Detach y_pred from the neural network G and put it inside D
-			y_pred_fake = D(x_fake.detach())
+			if param.arch == 1:
+				y_pred_fake = D(x_fake.detach())
+			else:
+				y_pred_fake = D(x_fake.detach(), labels)
 			if param.loss_D == 1:
 				errD_fake = criterion(y_pred_fake, y)
 			if param.loss_D == 2:
@@ -672,8 +661,13 @@ for i in range(iter_offset, param.n_iter):
 		G.zero_grad()
 		y.data.resize_(current_batch_size).fill_(1)
 		z.data.resize_(current_batch_size, param.z_size, 1, 1).normal_(0, 1)
-		fake = G(z)
-		y_pred_fake = D(fake)
+		if param.arch == 1:
+			fake = G(z, labels)
+			y_pred_fake = D(fake, labels)
+		else:
+			fake = G(z)
+			y_pred_fake = D(fake)
+		
 
 		if param.loss_D not in [1, 2, 3, 4]:
 			images = random_sample.__next__()
@@ -744,6 +738,7 @@ for i in range(iter_offset, param.n_iter):
 				'G_scheduler': decayG.state_dict(),
 				'D_scheduler': decayD.state_dict(),
 				'z_test': z_test,
+				'label_test': label_test,
 			}, '%s/models/state_%02d.pth' % (param.extra_folder, current_set_images))
 			s = 'Models saved'
 			print(s)
@@ -760,14 +755,20 @@ for i in range(iter_offset, param.n_iter):
 		# Generate 50k images for FID/Inception to be calculated later (not on this script, since running both tensorflow and pytorch at the same time cause issues)
 		ext_curr = 0
 		z_extra = torch.FloatTensor(100, param.z_size, 1, 1)
+		label_extra = torch.arange(10).repeat(10)
 		if param.cuda:
 			z_extra = z_extra.cuda()
+			label_extra = label_extra.cuda()
 		for ext in range(int(param.gen_extra_images/100)):
-			fake_test = G(Variable(z_extra.normal_(0, 1)))
+			if param.arch == 1:
+				fake_test = G(Variable(z_extra.normal_(0, 1)), Variable(label_test))
+			else:
+				fake_test = G(Variable(z_extra.normal_(0, 1)))
 			for ext_i in range(100):
 				vutils.save_image((fake_test[ext_i].data*.50)+.50, '%s/%01d/fake_samples_%05d.png' % (param.extra_folder, current_set_images,ext_curr), normalize=False, padding=0)
 				ext_curr += 1
 		del z_extra
+		del label_extra
 		del fake_test
 		# Later use this command to get FID of first set:
 		# python fid.py "/home/alexia/Output/Extra/01" "/home/alexia/Datasets/fid_stats_cifar10_train.npz" -i "/home/alexia/Inception" --gpu "0"
