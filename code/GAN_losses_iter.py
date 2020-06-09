@@ -137,7 +137,7 @@ if param.cuda:
 from IPython.display import Image
 to_img = transf.ToPILImage()
 
-import pytorch_visualize as pv
+#import pytorch_visualize as pv
 
 import math
 
@@ -169,10 +169,11 @@ trans = transf.Compose([
 ])
 
 ## Importing dataset
-data = dset.ImageFolder(root=param.input_folder, transform=trans)
+#data = dset.ImageFolder(root=param.input_folder, transform=trans)
 if param.CIFAR10:
 	data = dset.CIFAR10(root=param.CIFAR10_input_folder, train=True, download=False, transform=trans)
-
+else:
+	data = dset.ImageFolder(root=param.input_folder, transform=trans)        
 # Loading data randomly
 # def generate_random_sample():
 # 	while True:
@@ -186,7 +187,7 @@ class DataProvider:
         self.iter = None
         self.batch_size = batch_size
         self.data = data
-        self.data_loader = DataLoader(self.data, batch_size=self.batch_size, shuffle=True, drop_last=True, num_workers=param.num_workers)
+        self.data_loader = DataLoader(self.data, batch_size=self.batch_size, shuffle=True, drop_last=True, num_workers=8)
         self.build()
     def build(self):
         self.iter = iter(self.data_loader) 
@@ -233,7 +234,7 @@ if param.arch == 1:
 				mult = mult // 2
 
 			# end block 
-			model.append(torch.nn.ConvTranspose2d(param.G_h_size, param.n_channels, \
+			model.append(torch.nn.ConvTranspose2d(param.G_h_size, param.n_colors, \
 				kernel_size=4, stride=2, padding=1, bias=False))
 			model.append(torch.nn.Tanh())
 
@@ -252,7 +253,7 @@ if param.arch == 1:
 			model = []
 
 			# start block
-			model.append(spectral_norm(torch.nn.Conv2d(param.n_channels, param.D_h_size, kernel_size=4, stride=2, padding=1, bias=False)))
+			model.append(spectral_norm(torch.nn.Conv2d(param.n_colors, param.D_h_size, kernel_size=4, stride=2, padding=1, bias=False)))
 			model.append(torch.nn.LeakyReLU(0.2, inplace=True))
 
 			image_size_new = param.image_size // 2
@@ -274,13 +275,14 @@ if param.arch == 1:
 
 			self.label_emb = torch.nn.Embedding(param.n_classes, param.n_classes)
 			self.fc = spectral_norm(torch.nn.Linear(in_size + param.n_classes, 1, bias=False))
+			self.act = torch.nn.Sigmoid()
 
 		def forward(self, input, labels):
 			y = self.model(input)
 			y = y.view(-1, param.D_h_size * self.mult * 4 * 4)
 			y = torch.cat((self.label_emb(labels), y), -1)
 			
-			output = self.fc(y).view(-1, 1)
+			output = self.act(self.fc(y)).view(-1)
 
 			return output
 			
@@ -597,9 +599,9 @@ for i in range(iter_offset, param.n_iter):
 			y.data.resize_(current_batch_size).fill_(0)
 			# Detach y_pred from the neural network G and put it inside D
 			if param.arch == 1:
-				y_pred_fake = D(x_fake.detach())
-			else:
 				y_pred_fake = D(x_fake.detach(), labels)
+			else:
+				y_pred_fake = D(x_fake.detach())
 			if param.loss_D == 1:
 				errD_fake = criterion(y_pred_fake, y)
 			if param.loss_D == 2:
@@ -761,7 +763,7 @@ for i in range(iter_offset, param.n_iter):
 			label_extra = label_extra.cuda()
 		for ext in range(int(param.gen_extra_images/100)):
 			if param.arch == 1:
-				fake_test = G(Variable(z_extra.normal_(0, 1)), Variable(label_test))
+				fake_test = G(Variable(z_extra.normal_(0, 1)), Variable(label_extra))
 			else:
 				fake_test = G(Variable(z_extra.normal_(0, 1)))
 			for ext_i in range(100):
